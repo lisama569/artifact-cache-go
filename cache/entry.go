@@ -6,19 +6,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // FormatVersion 为当前条目格式版本。
 //
 // 版本兼容规则（确定性）：
-//   - v2（当前）：magic + version + 长度 + SHA-256 + 负载；
-//   - v1（旧版）：magic + version=1 + 裸负载，无校验和。可无损迁移到 v2；
+//   - v3（当前）：magic + version + 过期时间(8) + 长度(8) + SHA-256 + 负载；
+//   - v2（旧版）：magic + version=2 + 长度 + SHA-256 + 负载，无过期时间。
+//     校验和通过后可无损迁移到 v3（过期时间置 0 = 永不过期）；
+//   - v1（旧版）：magic + version=1 + 裸负载，无校验和。可无损迁移到 v3；
 //   - 其他（无 magic、版本高于当前、或版本无法识别）：明确拒绝并移除，
 //     绝不静默当作当前版本使用。
-const FormatVersion = 2
+const FormatVersion = 3
 
 var entryMagic = []byte("ACACHE")
 
@@ -30,13 +32,23 @@ var (
 	ErrUnsupportedVersion = errors.New("cache: unsupported entry version")
 )
 
-var entryHeaderLen = len(entryMagic) + 2 + 8 + sha256.Size
+// 当前格式头长：magic + version(2) + expiresAt(8) + length(8) + sha256(32)。
+var entryHeaderLen = len(entryMagic) + 2 + 8 + 8 + sha256.Size
 
-// encodeEntryV2 以当前格式编码条目。
-func encodeEntryV2(payload []byte) []byte {
+// v2 旧格式头长：magic + version(2) + length(8) + sha256(32)。
+var entryHeaderLenV2 = len(entryMagic) + 2 + 8 + sha256.Size
+
+// encodeEntry 以当前格式（v3）编码条目。
+// expiresAt 为零值表示永不过期，持久化为 0。
+func encodeEntry(payload []byte, expiresAt time.Time) []byte {
+	var nano int64
+	if !expiresAt.IsZero() {
+		nano = expiresAt.UnixNano()
+	}
 	buf := make([]byte, 0, entryHeaderLen+len(payload))
 	buf = append(buf, entryMagic...)
 	buf = binary.BigEndian.AppendUint16(buf, FormatVersion)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(nano))
 	buf = binary.BigEndian.AppendUint64(buf, uint64(len(payload)))
 	sum := sha256.Sum256(payload)
 	buf = append(buf, sum[:]...)
@@ -46,8 +58,8 @@ func encodeEntryV2(payload []byte) []byte {
 
 // writeEntryAtomic 将产物原子写入 path：先写同目录临时文件、fsync、再 rename，
 // 使并发读者只能看到完整旧条目或完整新条目，绝不看到部分写入。
-func writeEntryAtomic(path string, payload []byte) error {
-	data := encodeEntryV2(payload)
+func writeEntryAtomic(path string, payload []byte, expiresAt time.Time) error {
+	data := encodeEntry(payload, expiresAt)
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -74,71 +86,87 @@ func writeEntryAtomic(path string, payload []byte) error {
 	return nil
 }
 
-// readEntry 读取并校验当前版本条目。
+// readEntry 读取并校验当前版本条目，返回负载与过期时间（零值 = 永不过期）。
 // 截断、长度不符或校验和不匹配返回 ErrCorrupted；
 // 旧版本或无法识别的条目返回 ErrUnsupportedVersion（由 Open 统一迁移或拒绝）。
-func readEntry(path string) ([]byte, error) {
+func readEntry(path string) ([]byte, time.Time, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	return decodeEntry(data)
 }
 
-// decodeEntry 解析条目字节流。
-func decodeEntry(data []byte) ([]byte, error) {
+// decodeEntry 解析当前版本（v3）条目字节流。
+func decodeEntry(data []byte) ([]byte, time.Time, error) {
 	if len(data) < len(entryMagic)+2 || !bytes.Equal(data[:len(entryMagic)], entryMagic) {
-		return nil, ErrUnsupportedVersion
+		return nil, time.Time{}, ErrUnsupportedVersion
+	}
+	version := binary.BigEndian.Uint16(data[len(entryMagic):])
+	switch version {
+	case 1, 2:
+		return nil, time.Time{}, ErrUnsupportedVersion // 由 migrateEntry 处理
+	case FormatVersion:
+		// 继续解析
+	default:
+		return nil, time.Time{}, fmt.Errorf("%w: v%d", ErrUnsupportedVersion, version)
+	}
+	if len(data) < entryHeaderLen {
+		return nil, time.Time{}, fmt.Errorf("%w: truncated header", ErrCorrupted)
+	}
+	body := data[len(entryMagic)+2:]
+	nano := int64(binary.BigEndian.Uint64(body[:8]))
+	length := binary.BigEndian.Uint64(body[8:16])
+	wantSum := body[16 : 16+sha256.Size]
+	payload := body[16+sha256.Size:]
+	if uint64(len(payload)) != length {
+		return nil, time.Time{}, fmt.Errorf("%w: length mismatch (header %d, actual %d)", ErrCorrupted, length, len(payload))
+	}
+	sum := sha256.Sum256(payload)
+	if !bytes.Equal(sum[:], wantSum) {
+		return nil, time.Time{}, fmt.Errorf("%w: checksum mismatch", ErrCorrupted)
+	}
+	var expiresAt time.Time
+	if nano != 0 {
+		expiresAt = time.Unix(0, nano)
+	}
+	return payload, expiresAt, nil
+}
+
+// migrateEntry 尝试将旧版本条目迁移到当前格式（v3）。
+// 确定且可解释的规则：旧格式不含有效期信息，迁移后一律视为永不过期。
+//   - v1（裸负载）：直接取出负载重写为 v3；
+//   - v2（带长度与校验和）：校验通过后取出负载重写为 v3，校验失败拒绝迁移；
+//   - 其余：返回 ErrUnsupportedVersion。
+func migrateEntry(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(data) < len(entryMagic)+2 || !bytes.Equal(data[:len(entryMagic)], entryMagic) {
+		return ErrUnsupportedVersion
 	}
 	version := binary.BigEndian.Uint16(data[len(entryMagic):])
 	switch version {
 	case 1:
-		return nil, ErrUnsupportedVersion // 由 migrateEntry 处理
-	case FormatVersion:
-		// 继续解析
+		payload := data[len(entryMagic)+2:]
+		return writeEntryAtomic(path, payload, time.Time{})
+	case 2:
+		if len(data) < entryHeaderLenV2 {
+			return fmt.Errorf("%w: truncated v2 header", ErrCorrupted)
+		}
+		body := data[len(entryMagic)+2:]
+		length := binary.BigEndian.Uint64(body[:8])
+		wantSum := body[8 : 8+sha256.Size]
+		payload := body[8+sha256.Size:]
+		sum := sha256.Sum256(payload)
+		if uint64(len(payload)) != length || !bytes.Equal(sum[:], wantSum) {
+			return fmt.Errorf("%w: v2 checksum mismatch", ErrCorrupted)
+		}
+		return writeEntryAtomic(path, payload, time.Time{})
 	default:
-		return nil, fmt.Errorf("%w: v%d", ErrUnsupportedVersion, version)
-	}
-	if len(data) < entryHeaderLen {
-		return nil, fmt.Errorf("%w: truncated header", ErrCorrupted)
-	}
-	body := data[len(entryMagic)+2:]
-	length := binary.BigEndian.Uint64(body[:8])
-	wantSum := body[8 : 8+sha256.Size]
-	payload := body[8+sha256.Size:]
-	if uint64(len(payload)) != length {
-		return nil, fmt.Errorf("%w: length mismatch (header %d, actual %d)", ErrCorrupted, length, len(payload))
-	}
-	sum := sha256.Sum256(payload)
-	if !bytes.Equal(sum[:], wantSum) {
-		return nil, fmt.Errorf("%w: checksum mismatch", ErrCorrupted)
-	}
-	return payload, nil
-}
-
-// migrateEntry 尝试将旧版本条目迁移到当前格式。
-// v1（裸负载）可无损迁移；其余返回 ErrUnsupportedVersion。
-func migrateEntry(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	magicBuf := make([]byte, len(entryMagic)+2)
-	if _, err := io.ReadFull(f, magicBuf); err != nil {
 		return ErrUnsupportedVersion
 	}
-	if !bytes.Equal(magicBuf[:len(entryMagic)], entryMagic) {
-		return ErrUnsupportedVersion
-	}
-	if binary.BigEndian.Uint16(magicBuf[len(entryMagic):]) != 1 {
-		return ErrUnsupportedVersion
-	}
-	payload, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	return writeEntryAtomic(path, payload)
 }
 
 // fileSize 返回文件大小，不存在时返回 0。

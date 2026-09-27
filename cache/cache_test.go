@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // logResult 按要求的口径打印单测日志：缓存键、命中/未命中原因。
@@ -342,7 +343,7 @@ func TestLegacyEntriesMigratedOrRejected(t *testing.T) {
 
 	// 损坏的当前版本条目：必须被拒绝。
 	badKey, _ := DeriveKey(BuildInput{Toolchain: "go1.25.0", Args: []string{"bad"}})
-	bad := encodeEntryV2([]byte("x"))
+	bad := encodeEntry([]byte("x"), time.Time{})
 	bad = bad[:len(bad)-1]
 	if err := os.WriteFile(filepath.Join(dir, string(badKey)), bad, 0o644); err != nil {
 		t.Fatal(err)
