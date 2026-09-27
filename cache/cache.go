@@ -68,14 +68,19 @@ type entryMeta struct {
 	size      int64
 	expiresAt time.Time // 零值 = 永不过期
 	refs      int       // 正在读取的引用计数；>0 时不得被淘汰
-	elem      *list.Element
+	// publishing 表示该条目由巡检"认领"（并发构建已 rename 落盘但构建方
+	// 尚未把它纳入索引）。构建方提交前不得淘汰，否则会删掉构建方即将
+	// 声明的产物，造成索引/磁盘错位。
+	publishing bool
+	elem       *list.Element
 }
 
 // call 表示一次进行中的构建（单飞）。
 type call struct {
-	done    chan struct{}
-	payload []byte
-	err     error
+	done      chan struct{}
+	payload   []byte
+	err       error
+	expiresAt time.Time // 构建方为本次写入计算的过期时间（零值 = 永不过期）
 }
 
 // Cache 是基于本地文件系统的构建产物缓存。
@@ -90,6 +95,23 @@ type Cache struct {
 	lru      *list.List // 前端为最近使用
 	bytes    int64
 	inflight map[Key]*call
+
+	// pubMu 为"发布锁"，只协调两件事：
+	//   - 构建方把临时文件 rename 为最终条目文件（持有读锁）；
+	//   - 巡检收尾做目录重扫与对账（持有写锁）。
+	// 它不覆盖耗时的构建与临时文件写入，因此不会拖慢正常读写；
+	// 收尾取写锁后，不会有任何 rename 与收尾交错，收尾看到的目录
+	// 与索引可以做到逐文件一一对应。锁序固定为：mu → pubMu
+	// （收尾是先放 mu 再取 pubMu、再取 mu，二者不嵌套），无死锁。
+	pubMu sync.RWMutex
+
+	// 测试钩子（仅测试注入；nil 表示不触发）。
+	// afterBuildCommitted：构建方 rename 落盘、释放发布锁之后、
+	//   再取 mu 入索引之前触发（不持任何锁）。
+	// afterSweepScanned：巡检完成第一遍索引核对之后、释放 mu 等待
+	//   发布静止之前触发（持有 mu）。
+	afterBuildCommitted func(key Key)
+	afterSweepScanned   func()
 
 	hits, misses, builds, evictions int64
 	expired, migrated, rejected     int64
@@ -134,7 +156,7 @@ func Open(dir string, maxBytes int64, opts ...Option) (*Cache, error) {
 				if merr := migrateEntry(path); merr == nil {
 					c.migrated++
 					// 迁移后即为当前格式；旧格式无有效期信息，视为永不过期。
-					c.indexLocked(key, fileSize(path), time.Time{})
+					c.indexLocked(key, fileSize(path), time.Time{}, false)
 					continue
 				}
 				// 迁移失败：明确拒绝
@@ -153,7 +175,7 @@ func Open(dir string, maxBytes int64, opts ...Option) (*Cache, error) {
 			c.expired++
 			continue
 		}
-		c.indexLocked(key, fileSize(path), expiresAt)
+		c.indexLocked(key, fileSize(path), expiresAt, false)
 	}
 	c.evictLocked()
 	return c, nil
@@ -169,24 +191,27 @@ func (c *Cache) expiredLocked(m *entryMeta) bool {
 }
 
 // indexLocked 将条目加入索引与 LRU 前端；调用者须持有锁。
-func (c *Cache) indexLocked(key Key, size int64, expiresAt time.Time) {
+// publishing=true 表示该条目由巡检认领（构建方尚未提交），
+// 构建方提交前不得淘汰。
+func (c *Cache) indexLocked(key Key, size int64, expiresAt time.Time, publishing bool) {
 	if m, ok := c.entries[key]; ok {
 		c.bytes -= m.size
 		c.lru.Remove(m.elem)
 	}
-	m := &entryMeta{key: key, size: size, expiresAt: expiresAt}
+	m := &entryMeta{key: key, size: size, expiresAt: expiresAt, publishing: publishing}
 	m.elem = c.lru.PushFront(key)
 	c.entries[key] = m
 	c.bytes += size
 }
 
 // evictLocked 按 LRU（最久未使用优先）淘汰，直至占用不超过上限。
-// refs>0（正在被读取）的条目跳过不淘汰。调用者须持有锁。
+// refs>0（正在被读取）或 publishing（被巡检认领、构建方尚未提交）
+// 的条目跳过不淘汰。调用者须持有锁。
 func (c *Cache) evictLocked() {
 	for c.bytes > c.maxBytes {
 		victim := c.evictableLocked()
 		if victim == nil {
-			return // 其余条目均被钉住，待引用释放后再回收
+			return // 其余条目均被钉住，待引用释放/构建提交后再回收
 		}
 		c.removeLocked(victim)
 		c.evictions++
@@ -197,7 +222,7 @@ func (c *Cache) evictLocked() {
 func (c *Cache) evictableLocked() *entryMeta {
 	for e := c.lru.Back(); e != nil; e = e.Prev() {
 		m := c.entries[e.Value.(Key)]
-		if m.refs == 0 {
+		if m.refs == 0 && !m.publishing {
 			return m
 		}
 	}
@@ -294,7 +319,7 @@ func (c *Cache) buildLocked(ctx context.Context, key Key, expiresAt time.Time, b
 			return Result{Key: key, Reason: missReason}, ctx.Err()
 		}
 	}
-	cl := &call{done: make(chan struct{})}
+	cl := &call{done: make(chan struct{}), expiresAt: expiresAt}
 	c.inflight[key] = cl
 	c.mu.Unlock()
 
@@ -308,19 +333,37 @@ func (c *Cache) buildLocked(ctx context.Context, key Key, expiresAt time.Time, b
 		return Result{Key: key, Reason: missReason}, err
 	}
 
-	// 原子写入后再纳入索引；写入失败不污染缓存。
-	if werr := writeEntryAtomic(c.path(key), payload, expiresAt); werr != nil {
-		cl.err = werr
+	// 原子发布：暂存完整条目（含 fsync）后 rename。全程持有发布读锁，
+	// 与巡检收尾（发布写锁）互斥——巡检要么在 rename 前看到目录，
+	// 要么在 rename 后看到，绝不可能在中间态对账。
+	// 临时文件同样处于读锁保护下：巡检收尾时不会有写到一半的 .tmp 文件。
+	path := c.path(key)
+	c.pubMu.RLock()
+	tmpName, serr := stageEntry(filepath.Dir(path), payload, expiresAt)
+	if serr == nil {
+		serr = commitEntry(tmpName, path)
+	}
+	c.pubMu.RUnlock()
+	if serr != nil {
+		cl.err = serr
 		c.mu.Lock()
 		delete(c.inflight, key)
 		c.mu.Unlock()
 		close(cl.done)
-		return Result{Key: key, Reason: missReason}, werr
+		return Result{Key: key, Reason: missReason}, serr
 	}
+
+	// 测试钩子（如有）：已落盘、发布锁已释放，但尚未入索引。
+	if c.afterBuildCommitted != nil {
+		c.afterBuildCommitted(key)
+	}
+
 	cl.payload = payload
 	c.mu.Lock()
 	c.builds++
-	c.indexLocked(key, fileSize(c.path(key)), expiresAt)
+	// 若巡检在钩子期间把该产物"认领"进索引（publishing），此处用同一
+	// key 正常替换为构建方自己的元数据（publishing 解除），占用只计一次。
+	c.indexLocked(key, fileSize(path), expiresAt, false)
 	c.evictLocked()
 	delete(c.inflight, key)
 	c.mu.Unlock()

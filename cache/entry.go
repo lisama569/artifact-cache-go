@@ -58,29 +58,53 @@ func encodeEntry(payload []byte, expiresAt time.Time) []byte {
 
 // writeEntryAtomic 将产物原子写入 path：先写同目录临时文件、fsync、再 rename，
 // 使并发读者只能看到完整旧条目或完整新条目，绝不看到部分写入。
+//
+// 该函数供 Open 迁移等尚无并发的路径使用；并发构建路径改用
+// stageEntry + commitEntry，以便把"发布（rename）"置于发布锁协调之下。
 func writeEntryAtomic(path string, payload []byte, expiresAt time.Time) error {
-	data := encodeEntry(payload, expiresAt)
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	dir := filepath.Dir(path)
+	tmpName, err := stageEntry(dir, payload, expiresAt)
 	if err != nil {
 		return err
 	}
+	return commitEntry(tmpName, path)
+}
+
+// stageEntry 在 dir 下创建临时文件并写入完整条目（含 fsync），临时文件
+// 关闭后返回其路径。调用方须持有发布锁（Cache.pubMu 读锁）：这样巡检
+// 收尾取得发布写锁时，不可能看到构建写到一半的临时文件。
+// 任何失败都已清理临时文件。
+func stageEntry(dir string, payload []byte, expiresAt time.Time) (string, error) {
+	data := encodeEntry(payload, expiresAt)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return "", err
+	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
+	cleanup := func() {
 		tmp.Close()
 		os.Remove(tmpName)
-		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return "", err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+		cleanup()
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
-		return err
+		return "", err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+	return tmpName, nil
+}
+
+// commitEntry 将暂存好的完整条目原子重命名为最终路径；失败时清理暂存文件。
+// 调用方须持有发布锁（Cache.pubMu 读锁），与巡检收尾（写锁）互斥。
+func commitEntry(tmpPath, finalPath string) error {
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
 	return nil
