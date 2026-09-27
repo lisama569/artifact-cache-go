@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // logResult 按要求的口径打印单测日志：缓存键、命中/未命中原因。
@@ -22,8 +23,9 @@ func logResult(t *testing.T, r Result) {
 func logStats(t *testing.T, c *Cache) {
 	t.Helper()
 	s := c.Stats()
-	t.Logf("stats: entries=%d bytes=%d/%d hits=%d misses=%d builds=%d evictions=%d migrated=%d rejected=%d",
-		s.Entries, s.Bytes, s.MaxBytes, s.Hits, s.Misses, s.Builds, s.Evictions, s.Migrated, s.Rejected)
+	t.Logf("stats: entries=%d bytes=%d/%d hits=%d misses=%d builds=%d evictions=%d expired=%d migrated=%d rejected=%d sweeps=%d sweepRemoved=%d",
+		s.Entries, s.Bytes, s.MaxBytes, s.Hits, s.Misses, s.Builds, s.Evictions,
+		s.Expired, s.Migrated, s.Rejected, s.Sweeps, s.SweepRemoved)
 }
 
 // diskUsage 统计缓存目录实际占用，用于校验与 Stats.Bytes 口径一致。
@@ -334,6 +336,13 @@ func TestLegacyEntriesMigratedOrRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// v2 旧版条目：长度 + SHA-256 + 负载，同样应升级到当前 v3。
+	v2Key, _ := DeriveKey(BuildInput{Toolchain: "go1.25.0", Args: []string{"legacy-v2"}})
+	v2Payload := []byte("legacy v2 artifact")
+	if err := os.WriteFile(filepath.Join(dir, string(v2Key)), encodeEntryV2(v2Payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	// 无法识别的条目（无 magic）：必须被拒绝。
 	junkKey, _ := DeriveKey(BuildInput{Toolchain: "go1.25.0", Args: []string{"junk"}})
 	if err := os.WriteFile(filepath.Join(dir, string(junkKey)), []byte("random bytes"), 0o644); err != nil {
@@ -342,7 +351,7 @@ func TestLegacyEntriesMigratedOrRejected(t *testing.T) {
 
 	// 损坏的当前版本条目：必须被拒绝。
 	badKey, _ := DeriveKey(BuildInput{Toolchain: "go1.25.0", Args: []string{"bad"}})
-	bad := encodeEntryV2([]byte("x"))
+	bad := encodeEntryV3([]byte("x"), time.Now(), 0)
 	bad = bad[:len(bad)-1]
 	if err := os.WriteFile(filepath.Join(dir, string(badKey)), bad, 0o644); err != nil {
 		t.Fatal(err)
@@ -354,25 +363,30 @@ func TestLegacyEntriesMigratedOrRejected(t *testing.T) {
 	}
 	s := c.Stats()
 	logStats(t, c)
-	if s.Migrated != 1 || s.Rejected != 2 {
-		t.Fatalf("migrated=%d rejected=%d, want 1/2", s.Migrated, s.Rejected)
+	if s.Migrated != 2 || s.Rejected != 2 {
+		t.Fatalf("migrated=%d rejected=%d, want 2/2", s.Migrated, s.Rejected)
 	}
 
-	// 迁移后的 v1 条目必须可正常命中。
-	r, err := c.GetOrBuild(context.Background(), v1Key,
-		func() ([]byte, error) { return nil, errors.New("should not build") })
-	if err != nil {
-		t.Fatal(err)
-	}
-	logResult(t, r)
-	if !r.Hit || string(r.Payload) != string(v1Payload) {
-		t.Fatalf("migrated entry not usable: %+v", r)
+	// 迁移后的旧条目必须可正常命中。
+	for _, tc := range []struct {
+		key     Key
+		payload []byte
+	}{{v1Key, v1Payload}, {v2Key, v2Payload}} {
+		r, err := c.GetOrBuild(context.Background(), tc.key,
+			func() ([]byte, error) { return nil, errors.New("should not build") })
+		if err != nil {
+			t.Fatal(err)
+		}
+		logResult(t, r)
+		if !r.Hit || string(r.Payload) != string(tc.payload) {
+			t.Fatalf("migrated entry not usable: %+v payload=%q", r, r.Payload)
+		}
 	}
 
 	// 被拒绝的条目按未命中处理，重新构建。
 	var builds atomic.Int64
 	b := func() ([]byte, error) { builds.Add(1); return []byte("rebuilt"), nil }
-	r, _ = c.GetOrBuild(context.Background(), junkKey, b)
+	r, _ := c.GetOrBuild(context.Background(), junkKey, b)
 	logResult(t, r)
 	r, _ = c.GetOrBuild(context.Background(), badKey, b)
 	logResult(t, r)
