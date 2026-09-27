@@ -93,6 +93,11 @@ type Cache struct {
 
 	hits, misses, builds, evictions int64
 	expired, migrated, rejected     int64
+
+	// sweepMidHook 仅供测试注入：在巡检扫描中途（索引核对之后、
+	// 认领与孤儿清理之前）回调，用于稳定复现"巡检进行中并发构建落盘"
+	// 的交错时序。生产代码不得设置。
+	sweepMidHook func()
 }
 
 // Open 打开（必要时创建）位于 dir 的缓存，容量上限为 maxBytes。
